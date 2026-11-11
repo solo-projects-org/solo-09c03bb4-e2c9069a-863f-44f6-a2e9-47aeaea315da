@@ -17,13 +17,22 @@ from app.analysis import (
     analyze_coverage,
     validate_uploads,
 )
+from app.changes import (
+    DIRECTION_LABELS,
+    detect_changes,
+    validate_mask_pair,
+)
 
 app = FastAPI(
     title="农情遥感补采分析 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "上传一张地块编号图和任一数量的单波段无云掩膜，统计每个地块的"
-        "总像元数与至少一景无云覆盖的像元数，并返回覆盖率低于目标值的地块。"
+        "能力一：上传地块编号图和各景单波段无云掩膜，统计每个地块的总像元数"
+        "与至少一景无云覆盖的像元数，返回覆盖率低于目标值的地块。\n\n"
+        "能力二：上传同一景影像的两版单波段云掩膜（0 有云、1 无云），"
+        "按行分带流式比较重叠处双方都有效的像元，把变化方向相同、四连通的"
+        "像元连成一片（跨条带合并），结算后按最小像元数筛选并返回变化方向、"
+        "像元数与原坐标系外接范围。"
     ),
 )
 
@@ -44,6 +53,37 @@ class AnalysisResponse(BaseModel):
     below_target_count: int
     parcels: list[ParcelCoverage] = Field(
         description="低于目标覆盖率的地块，按地块编号升序排列"
+    )
+
+
+class Bounds(BaseModel):
+    min_x: float = Field(description="外接矩形西边界（原坐标系坐标）")
+    min_y: float = Field(description="外接矩形南边界（原坐标系坐标）")
+    max_x: float = Field(description="外接矩形东边界（原坐标系坐标）")
+    max_y: float = Field(description="外接矩形北边界（原坐标系坐标）")
+
+
+class ChangeRegionOut(BaseModel):
+    region_id: int = Field(description="变化区域编号，按扫描顺序（先行后列）从 1 开始")
+    direction: str = Field(
+        description="变化方向：`无云变有云（1→0）` 或 `有云变无云（0→1）`"
+    )
+    pixel_count: int = Field(description="该区域包含的变化像元数")
+    bounds: Bounds = Field(description="原坐标系下的外接范围（像元边缘对齐）")
+
+
+class ChangeResponse(BaseModel):
+    min_pixels: int
+    crs: str | None = Field(
+        description="两景掩膜共用的坐标系（CRS 标识）；外接范围即该坐标系下的坐标"
+    )
+    overlap_pixels: int = Field(
+        description="两景重叠范围内，两图都有效的像元总数（仅这些像元参与比较）"
+    )
+    change_pixel_count: int = Field(description="达标区域合计的变化像元数")
+    region_count: int
+    regions: list[ChangeRegionOut] = Field(
+        description="像元数达到 min_pixels 的成片变化区域，按扫描顺序排列"
     )
 
 
@@ -178,4 +218,116 @@ def analyze(
             )
             for r in below
         ],
+    )
+
+
+@app.post(
+    "/changes",
+    response_model=ChangeResponse,
+    tags=["分析"],
+    summary="找出两版云掩膜之间值得回看原影像的成片变化",
+    responses={
+        400: {
+            "description": "两景影像不兼容、无重叠，或 min_pixels 不合法",
+        }
+    },
+)
+def detect_mask_changes(
+    mask_before: Annotated[
+        UploadFile,
+        File(description="旧版单波段 GeoTIFF 云掩膜：0 为有云，1 为无云"),
+    ],
+    mask_after: Annotated[
+        UploadFile,
+        File(description="新版单波段 GeoTIFF 云掩膜：0 为有云，1 为无云"),
+    ],
+    min_pixels: Annotated[
+        int,
+        Form(
+            description=(
+                "每片变化区域至少包含的像元数；区域结算后才按该阈值筛选，"
+                "小于该值的成片变化不返回"
+            )
+        ),
+    ],
+) -> ChangeResponse:
+    if not isinstance(min_pixels, int) or min_pixels < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="min_pixels 必须是不小于 1 的整数。",
+        )
+
+    with tempfile.TemporaryDirectory(prefix="mask-changes-") as tmp:
+        tmp_dir = Path(tmp)
+        before_name = _safe_upload_name(mask_before, 1)
+        after_name = _safe_upload_name(mask_after, 2)
+        before_dest = tmp_dir / "mask_before.tif"
+        after_dest = tmp_dir / "mask_after.tif"
+        _save_upload(mask_before, before_dest)
+        _save_upload(mask_after, after_dest)
+
+        before_upload = UploadedRaster(
+            path=str(before_dest), filename=before_name, role="mask_before"
+        )
+        after_upload = UploadedRaster(
+            path=str(after_dest), filename=after_name, role="mask_after"
+        )
+        meta_before, meta_after, errors = validate_mask_pair(
+            before_upload, after_upload
+        )
+        if errors:
+            raise _incompatible_response(errors)
+
+        assert meta_before is not None and meta_after is not None
+        result = detect_changes(meta_before, meta_after, min_pixels)
+
+    if result.overlap_pixels == 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "两景掩膜没有可比较的像元：空间范围不重叠，或重叠处无双方都有效的像元。",
+                "incompatible_files": [
+                    {
+                        "filename": before_name,
+                        "role": "mask_before",
+                        "reason": "与新版掩膜无有效重叠",
+                    },
+                    {
+                        "filename": after_name,
+                        "role": "mask_after",
+                        "reason": "与旧版掩膜无有效重叠",
+                    },
+                ],
+            },
+        )
+
+    transform = result.transform_a
+    regions_out: list[ChangeRegionOut] = []
+    for index, region in enumerate(result.regions, start=1):
+        # Pixel edges: column c spans [c, c+1) pixels; row r spans [r, r+1).
+        west = transform.c + region.min_col * transform.a
+        east = transform.c + (region.max_col + 1) * transform.a
+        north = transform.f + region.min_row * transform.e
+        south = transform.f + (region.max_row + 1) * transform.e
+        regions_out.append(
+            ChangeRegionOut(
+                region_id=index,
+                direction=DIRECTION_LABELS[region.direction],
+                pixel_count=region.pixel_count,
+                bounds=Bounds(
+                    min_x=west,
+                    min_y=south,
+                    max_x=east,
+                    max_y=north,
+                ),
+            )
+        )
+
+    return ChangeResponse(
+        min_pixels=min_pixels,
+        crs=result.crs,
+        overlap_pixels=result.overlap_pixels,
+        change_pixel_count=sum(r.pixel_count for r in regions_out),
+        region_count=len(regions_out),
+        regions=regions_out,
     )
